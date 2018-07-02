@@ -2,13 +2,13 @@
 main:
    - title: "Get Started"
      url: /get-started/
-   - title: "Support"
+   - title: "Get Support"
      url: /support/
-     thumbnail: /djongo/assets/images/help.png
-     class: support
    - title: "Discuss"
      url: /discuss/
-   - title: "Get The Source"
+   - title: "API Reference"
+     url: /api/
+   - title: "Source"
      url: https://github.com/nesdis/djongo/
 
 #   - title: "Donate"
@@ -20,31 +20,37 @@ docs:
   - title: "Get started"
     url: /get-started/
 
-  - title: "Tutorial"
+  - title: "Integrating Django With MongoDB"
+    url: /integrating-django-with-mongodb/
+  - title: "Using Djongo Fields"
     children:
-      - title: "Integrating Django With MongoDB"
-        url: /integrating-django-with-mongodb/
-      - title: "Djongo Model fields"
-        url: /using-django-with-mongodb-data-fields/
-      - title: "Array and List fields"
-        url: /using-django-with-mongodb-array-field/
-      - title: "Creating Capped Models"
-        url: /creating-django-capped-models-using-mongodb/
+    - title: "Embedded Model Field"
+      url: /using-django-with-mongodb-data-fields/
+    - title: "Array Model Field"
+      url: /using-django-with-mongodb-array-field/
+    - title: "Array Reference Field"
+      url: /using-django-with-mongodb-array-reference-field/
+    - title: "ObjectID Field"
+      url: /using-django-with-objectid-field/
+  - title: "Creating Capped Models"
+    url: /creating-django-capped-models-using-mongodb/
 
-  - title: "API Reference"
+  - title: "Quick Reference"
     children:
-      - title: "Database configuration"
-        url: /database-configuration/
-      - title: "Embedded Model Field"
-        url: /embedded-model-field/
-      - title: "Array Model Field"
-        url: /array-model-field/
-      - title: "Array Reference Field"
-        url: /mongodb-field-reference/#arrayreferencefield
-      - title: "ObjectID Field"
-        url: /mongodb-field-reference/#objectidfield
-      - title: "List Field"
-        url: /mongodb-field-reference/#listfield
+    - title: "Database configuration"
+      url: /database-configuration/
+    - title: "Embedded Model Field"
+      url: /embedded-model-field/
+    - title: "Array Model Field"
+      url: /array-model-field/
+    - title: "Array Reference Field"
+      url: /mongodb-field-reference/#arrayreferencefield
+    - title: "ObjectID Field"
+      url: /mongodb-field-reference/#objectidfield
+    - title: "List Field"
+      url: /mongodb-field-reference/#listfield
+    - title: "JSON Field"
+      url: /mongodb-field-reference/#jsonfield
 
   - title: "Other resources"
     children:
@@ -52,5 +58,9 @@ docs:
         url: /different-ways-to-integrate-django-with-mongodb/
       - title: "Djongo design documentation"
         url: /django-mongodb-connector-design-document/
-      - title: "Roadmap"
-        url: /roadmap/
+#      - title: "Roadmap"
+#        url: /roadmap/
+
+  - title: "Donate"
+    url: /donate/
+    thumbnail: /djongo/assets/images/heart.png

@@ -1,7 +1,15 @@
 """
 The standard way of using djongo is to import models.py
 in place of Django's standard models module.
+Djongo Fields is where custom fields for working with
+MongoDB is defined.
+ - EmbeddedModelField
+ - ArrayModelField
+ - ArrayReferenceField
+ - GenericReferenceField
+These are the main fields for working with MongoDB.
 """
+
 from bson import ObjectId
 from django.db.models import (
     Manager, Model, Field, AutoField,
@@ -9,11 +17,12 @@ from django.db.models import (
 )
 from django import forms
 from django.core.exceptions import ValidationError
-from django.db import router
+from django.db import router, connections, transaction
 from django.db import connections as pymongo_connections
 import typing
-import inspect
+import functools
 
+from django.db.models.fields.mixins import FieldCacheMixin
 from django.forms import modelform_factory
 from django.utils.html import format_html_join, format_html
 from pymongo.collection import Collection
@@ -23,7 +32,7 @@ from django.db.models.fields.related_descriptors import ForwardManyToOneDescript
     create_forward_many_to_many_manager, ReverseManyToOneDescriptor
 from django.utils.functional import cached_property
 from django.utils.safestring import mark_safe
-
+from django.utils.translation import gettext_lazy as _
 
 def make_mdl(model, model_dict):
     """
@@ -37,8 +46,7 @@ def make_mdl(model, model_dict):
 
 
 def useful_field(field):
-    return field.concrete and not (field.is_relation
-                                   or isinstance(field, (AutoField, BigAutoField)))
+    return field.concrete and not isinstance(field, (AutoField, BigAutoField))
 
 
 class ModelSubterfuge:
@@ -47,38 +55,49 @@ class ModelSubterfuge:
         self.subterfuge = embedded_model
 
 
-class manager_descriptior:
-
-    def __init__(self, name):
-        self.name = name
-
-    def __get__(self, manager_instance, objtype=None):
-        cli = (pymongo_connections[manager_instance.db]
-            .cursor().db_conn[manager_instance.model
-            ._meta.db_table]
-            )
-        return getattr(cli, self.name)
-
-
-class DjongoManagerBase(type):
-
-    def __new__(cls, name, bases, attrs):
-        for name, _ in inspect.getmembers(Collection):
-            if name.startswith('_'):
-                continue
-            attrs['mongo_'+name] = manager_descriptior(name)
-
-        return super().__new__(cls, name, bases, attrs)
-
-
-class DjongoManager(Manager, metaclass=DjongoManagerBase):
+class DjongoManager(Manager):
     """
     This modified manager allows to issue Mongo functions by prefixing
     them with 'mongo_'.
-
     This module allows methods to be passed directly to pymongo.
     """
-    pass
+    def __getattr__(self, name):
+        if name.startswith('mongo'):
+            name = name[6:]
+            cli = (
+                pymongo_connections[self.db]
+                .cursor()
+                .db_conn[self.model._meta.db_table]
+            )
+            return getattr(cli, name)
+        else:
+            return super().__getattr__(name)
+
+
+class JSONField(Field):
+    """
+    MongoDB JsonField (Array or Dictionnary)
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._value = {}
+        super().__init__(*args, **kwargs)
+
+    def __set__(self, instance, value):
+        if not isinstance(value, dict) and not isinstance(value, list):
+            raise ValueError("Value must be a dict or list")
+
+    def __get__(self, instance, owner):
+        return self._value
+
+    def get_db_prep_value(self, value, connection, prepared=False):
+        if prepared:
+            return value
+
+        if not isinstance(value, dict) and not isinstance(value, list):
+            raise ValueError("Value must be a dict or list")
+
+        return value
 
 class ListField(Field):
     """
@@ -112,39 +131,31 @@ class ListField(Field):
 class ArrayModelField(Field):
     """
     Implements an array of objects inside the document.
-
     The allowed object type is defined on model declaration. The
     declared instance will accept a python list of instances of the
     given model as its contents.
-
     The model of the container must be declared as abstract, thus should
     not be treated as a collection of its own.
-
     Example:
-
     class Author(models.Model):
         name = models.CharField(max_length=100)
         email = models.CharField(max_length=100)
-
         class Meta:
             abstract = True
-
-
     class AuthorForm(forms.ModelForm):
         class Meta:
             model = Author
             fields = (
                 'name', 'email'
             )
-
     class MultipleBlogPosts(models.Model):
         h1 = models.CharField(max_length=100)
         content = models.ArrayModelField(
             model_container=BlogContent,
             model_form_class=BlogContentForm
         )
-
     """
+
     empty_strings_allowed = False
 
     def __init__(self,
@@ -154,7 +165,7 @@ class ArrayModelField(Field):
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_container = model_container
-        self.model_form_class = model_form_class or modelform_factory(model_container, fields='__all__')
+        self.model_form_class = model_form_class
 
         if model_form_kwargs_l is None:
             model_form_kwargs_l = {}
@@ -221,6 +232,7 @@ class ArrayModelField(Field):
         """
         defaults = {
             'form_class': ArrayFormField,
+            'model_container': self.model_container,
             'model_form_class': self.model_form_class,
             'name': self.attname,
             'mdl_form_kw_l': self.model_form_kwargs_l
@@ -241,18 +253,43 @@ class ArrayModelField(Field):
             raise ValidationError(errors)
 
 
-class ArrayFormField(forms.Field):
-    def __init__(self, name, model_form_class, mdl_form_kw_l, *args, **kwargs):
-        self.name = name
-        self.model_form_class = model_form_class
-        self.mdl_form_kw_l = mdl_form_kw_l
+def _get_model_form_class(model_form_class, model_container, admin, request):
+    if not model_form_class:
+        form_kwargs = dict(
+            form=forms.ModelForm,
+            fields=forms.ALL_FIELDS,
+        )
 
-        widget = ArrayFormWidget(model_form_class.__name__)
+        if admin and request:
+            form_kwargs['formfield_callback'] = functools.partial(
+                admin.formfield_for_dbfield, request=request)
+
+        model_form_class = modelform_factory(model_container, **form_kwargs)
+
+    return model_form_class
+
+
+class ArrayFormField(forms.Field):
+    def __init__(self, name, model_form_class, model_container, mdl_form_kw_l,
+                 widget=None, admin=None, request=None, *args, **kwargs):
+
+        self.name = name
+        self.model_container = model_container
+        self.model_form_class = _get_model_form_class(
+            model_form_class, model_container, admin, request)
+        self.mdl_form_kw_l = mdl_form_kw_l
+        self.admin = admin
+        self.request = request
+
+        if not widget:
+            widget = ArrayFormWidget(self.model_form_class.__name__)
+
         error_messages = {
             'incomplete': 'Enter all required fields.',
         }
 
-        self.ArrayFormSet = forms.formset_factory(self.model_form_class, can_delete=True)
+        self.ArrayFormSet = forms.formset_factory(
+            self.model_form_class, can_delete=True)
         super().__init__(error_messages=error_messages,
                          widget=widget, *args, **kwargs)
 
@@ -293,7 +330,6 @@ class ArrayFormField(forms.Field):
 class ArrayFormBoundField(forms.BoundField):
     def __init__(self, form, field, name):
         super().__init__(form, field, name)
-        ArrayFormSet = forms.formset_factory(field.model_form_class, can_delete=True)
 
         data = self.data if form.is_bound else None
         initial = []
@@ -307,8 +343,7 @@ class ArrayFormBoundField(forms.BoundField):
                             exclude=field.model_form_class._meta.exclude
                         ))
 
-        self.form_set = ArrayFormSet(data, initial=initial,
-                                     prefix=name)
+        self.form_set = field.ArrayFormSet(data, initial=initial, prefix=name)
 
     def __getitem__(self, idx):
         if not isinstance(idx, (int, slice)):
@@ -320,8 +355,16 @@ class ArrayFormBoundField(forms.BoundField):
             yield form
 
     def __str__(self):
-        table = format_html_join('\n','<tbody>{}</tbody>', ((form.as_table(),) for form in self.form_set))
-        table = format_html('\n<table class="{}-array-model-field">\n{}\n</table>', self.name, table)
+        table = format_html_join(
+            '\n','<tbody>{}</tbody>',
+            ((form.as_table(),)
+             for form in self.form_set))
+        table = format_html(
+            '\n<table class="{}-array-model-field">'
+            '\n{}'
+            '\n</table>',
+            self.name,
+            table)
         return format_html('{}\n{}',table, self.form_set.management_form)
 
     def __len__(self):
@@ -354,31 +397,25 @@ class EmbeddedModelField(Field):
     """
     Allows for the inclusion of an instance of an abstract model as
     a field inside a document.
-
     Example:
-
-    class Author(models.Model):
+    class Blog(models.Model):
         name = models.CharField(max_length=100)
-        email = models.CharField(max_length=100)
-
+        tagline = models.TextField()
         class Meta:
             abstract = True
-
-
-    class AuthorForm(forms.ModelForm):
+    class BlogForm(forms.ModelForm):
         class Meta:
-            model = Author
+            model = Blog
             fields = (
-                'name', 'email'
+                'comment', 'author'
             )
-
-    class MultipleBlogPosts(models.Model):
-        h1 = models.CharField(max_length=100)
-        content = models.ArrayModelField(
-            model_container=BlogContent,
-            model_form_class=BlogContentForm
+    class Entry(models.Model):
+        blog = models.EmbeddedModelField(
+            model_container=Blog,
+            model_form_class=BlogForm
         )
-
+        headline = models.CharField(max_length=255)
+        objects = models.DjongoManager()
     """
     empty_strings_allowed = False
 
@@ -386,12 +423,16 @@ class EmbeddedModelField(Field):
                  model_container: typing.Type[Model],
                  model_form_class: typing.Type[forms.ModelForm]=None,
                  model_form_kwargs: dict=None,
+                 admin=None,
+                 request=None,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_container = model_container
-        self.model_form_class = model_form_class or modelform_factory(model_container, fields='__all__')
+        self.model_form_class = model_form_class
         self.null = True
         self.instance = None
+        self.admin = admin
+        self.request = request
 
         if model_form_kwargs is None:
             model_form_kwargs = {}
@@ -420,7 +461,12 @@ class EmbeddedModelField(Field):
             value = value.subterfuge
 
         if not isinstance(value, Model):
-            raise ValueError('Value must be instance of Model')
+            raise ValueError(
+                'Value: {value} must be instance of Model: {model}'.format(
+                     value=value,
+                     model=Model
+                )
+            )
 
         mdl_ob = {}
         for fld in value._meta.get_fields():
@@ -443,15 +489,13 @@ class EmbeddedModelField(Field):
             return value
         assert isinstance(value, dict)
 
-        self.instance = make_mdl(self.model_container, value)
-        return self.instance
+        instance = make_mdl(self.model_container, value)
+        return instance
 
     def formfield(self, **kwargs):
-        if not self.model_form_class:
-            raise ValidationError('Implementing model form class needed to create field')
-
         defaults = {
             'form_class': EmbeddedFormField,
+            'model_container': self.model_container,
             'model_form_class': self.model_form_class,
             'model_form_kw': self.model_form_kwargs,
             'name': self.attname
@@ -462,7 +506,8 @@ class EmbeddedModelField(Field):
 
 
 class EmbeddedFormField(forms.MultiValueField):
-    def __init__(self, name, model_form_class, model_form_kw, *args, **kwargs):
+    def __init__(self, name, model_form_class, model_form_kw, model_container,
+                 admin=None, request=None, *args, **kwargs):
         form_fields = []
         mdl_form_field_names = []
         widgets = []
@@ -477,14 +522,17 @@ class EmbeddedFormField(forms.MultiValueField):
         if initial:
             model_form_kwargs['initial'] = initial
 
-        self.model_form_class = model_form_class
+        self.model_form_class = _get_model_form_class(
+            model_form_class, model_container, admin, request)
         self.model_form_kwargs = model_form_kwargs
+        self.admin = admin
+        self.request = request
 
         error_messages = {
             'incomplete': 'Enter all required fields.',
         }
 
-        self.model_form = model_form_class(**model_form_kwargs)
+        self.model_form = self.model_form_class(**model_form_kwargs)
         for field_name, field in self.model_form.fields.items():
             if isinstance(field, (forms.ModelChoiceField, forms.ModelMultipleChoiceField)):
                 continue
@@ -557,24 +605,8 @@ class EmbeddedFormWidget(forms.MultiWidget):
             for i, widget in enumerate(self.widgets)
         )
 
-class ObjectIdField(AutoField):
-    """
-    For every document inserted into a collection MongoDB internally creates an field.
-    The field can be referenced from within the Model as _id.
-    """
-
-    def __init__(self, *args, **kwargs):
-        id_field_args = {
-            'primary_key': True,
-        }
-        id_field_args.update(kwargs)
-        super().__init__(*args, **id_field_args)
-
-    def get_prep_value(self, value):
-        value = super(AutoField, self).get_prep_value(value)
-        if value is None:
-            return None
-        return value
+class ObjectIdFieldMixin:
+    description = _("ObjectId")
 
     def get_db_prep_value(self, value, connection, prepared=False):
         return self.to_python(value)
@@ -585,8 +617,156 @@ class ObjectIdField(AutoField):
         return value
 
 
+class GenericObjectIdField(ObjectIdFieldMixin, Field):
+    empty_strings_allowed = False
+
+
+class ObjectIdField(ObjectIdFieldMixin, AutoField):
+    """
+    For every document inserted into a collection MongoDB internally creates an field.
+    The field can be referenced from within the Model as _id.
+    """
+
+    def __init__(self, *args, **kwargs):
+        id_field_args = {
+            'primary_key': True,
+            'auto_created': True
+        }
+        id_field_args.update(kwargs)
+        super().__init__(*args, **id_field_args)
+
+    def get_prep_value(self, value):
+        value = super(AutoField, self).get_prep_value(value)
+        if value is None:
+            return None
+        return value
+
+
+
+
+class ArrayReferenceManagerMixin:
+
+    def _apply_rel_filters(self, queryset):
+        """
+        Filter the queryset for the instance this manager is bound to.
+        """
+        queryset._add_hints(instance=self.instance)
+        if self._db:
+            queryset = queryset.using(self._db)
+        queryset = queryset.filter(**self.core_filters)
+
+        return queryset
+
+    def get_queryset(self):
+        try:
+            return self.instance._prefetched_objects_cache[self.field.related_query_name()]
+        except (AttributeError, KeyError):
+            queryset = super().get_queryset()
+            return self._apply_rel_filters(queryset)
+
+    def update_or_create(self, **kwargs):
+        db = router.db_for_write(self.instance.__class__, instance=self.instance)
+        obj, created = super(ArrayReferenceManagerMixin, self.db_manager(db)).update_or_create(**kwargs)
+        # We only need to add() if created because if we got an object back
+        # from get() then the relationship already exists.
+        if created:
+            self.add(obj)
+        return obj, created
+    update_or_create.alters_data = True
+
+    def get_or_create(self, **kwargs):
+        db = router.db_for_write(self.instance.__class__, instance=self.instance)
+        obj, created = super(ArrayReferenceManagerMixin, self.db_manager(db)).get_or_create(**kwargs)
+        # We only need to add() if created because if we got an object back
+        # from get() then the relationship already exists.
+        if created:
+            self.add(obj)
+        return obj, created
+    get_or_create.alters_data = True
+
+    def create(self, **kwargs):
+        db = router.db_for_write(self.instance.__class__, instance=self.instance)
+        new_obj = super(ArrayReferenceManagerMixin, self.db_manager(db)).create(**kwargs)
+        self.add(new_obj)
+        return new_obj
+    create.alters_data = True
+
+
 def create_reverse_array_reference_manager(superclass, rel):
-    pass
+    if issubclass(superclass, DjongoManager):
+        baseclass = superclass
+    else:
+        baseclass = type('baseclass', (DjongoManager, superclass), {})
+
+    class ReverseArrayReferenceManager(ArrayReferenceManagerMixin, baseclass):
+        def __init__(self, instance):
+            super().__init__()
+            self.instance = instance
+            self.model = rel.related_model
+            self.field = rel.remote_field
+
+            name = rel.remote_field.name
+            self.core_filters = {name: instance}
+
+        def __call__(self, *, manager):
+            manager = getattr(self.model, manager)
+            manager_class = create_reverse_array_reference_manager(manager.__class__, rel)
+            return manager_class(instance=self.instance)
+        do_not_call_in_templates = True
+
+        def _apply_rel_filters(self, queryset):
+            queryset = super()._apply_rel_filters(queryset)
+            db = self._db or router.db_for_read(self.model, instance=self.instance)
+            empty_strings_as_null = connections[db].features.interprets_empty_strings_as_nulls
+
+            for field in self.field.foreign_related_fields:
+                val = getattr(self.instance, field.attname)
+                if val is None or (val == '' and empty_strings_as_null):
+                    return queryset.none()
+            return queryset
+
+        def _make_filter(self, *objs):
+            ids = set(obj.pk for obj in objs)
+            return {
+                self.model._meta.pk.name: {
+                    '$in': list(ids)
+                }
+            }
+
+        def add(self, *objs):
+            _filter = self._make_filter(*objs)
+            lh_field, rh_field = self.field.related_fields[0]
+            self.mongo_update(
+                _filter,
+                {
+                    '$addToSet': {
+                        lh_field.get_attname():
+                            getattr(self.instance, rh_field.get_attname())
+                    }
+                }
+            )
+            for obj in objs:
+                fk_field = getattr(obj, lh_field.get_attname())
+                fk_field.add(getattr(self.instance, rh_field.get_attname()))
+        add.alters_data = True
+
+        def remove(self, *objs):
+            pass
+        remove.alters_data = True
+
+        def clear(self):
+            pass
+        clear.alters_data = True
+
+        def set(self, objs, *, clear=False):
+            pass
+        set.alters_data = True
+
+        def create(self, **kwargs):
+            pass
+        create.alters_data = True
+
+    return ReverseArrayReferenceManager
 
 def create_forward_array_reference_manager(superclass, rel):
 
@@ -595,14 +775,14 @@ def create_forward_array_reference_manager(superclass, rel):
     else:
         baseclass = type('baseclass', (DjongoManager, superclass), {})
 
-    class ArrayReferenceManager(baseclass):
+    class ArrayReferenceManager(ArrayReferenceManagerMixin, baseclass):
 
         def __init__(self, instance):
             super().__init__()
 
             self.instance = instance
             self.model = rel.model
-            self.field = rel.field
+            self.field = rel.remote_field
             self.instance_manager = DjongoManager()
             self.instance_manager.model = instance
             name = self.field.related_fields[0][1].attname
@@ -610,23 +790,43 @@ def create_forward_array_reference_manager(superclass, rel):
 
             self.core_filters = {f'{name}__in': ids}
 
-        def add(self, *objs):
+        def __call__(self, *, manager):
+            manager = getattr(self.model, manager)
+            manager_class = create_forward_array_reference_manager(manager.__class__, rel)
+            return manager_class(instance=self.instance)
+        do_not_call_in_templates = True
 
-            fks = getattr(self.instance, self.field.attname)
+        def _apply_rel_filters(self, queryset):
+            queryset = super()._apply_rel_filters(queryset)
+            if not getattr(self.instance, self.field.attname):
+                return queryset.none()
+            return queryset
+
+        def get_queryset(self):
+            try:
+                return self.instance._prefetched_objects_cache[self.field.related_query_name()]
+            except (AttributeError, KeyError):
+                queryset = super().get_queryset()
+                return self._apply_rel_filters(queryset)
+
+        def _make_filter(self):
+            return {self.instance._meta.pk.name: self.instance.pk}
+
+        def add(self, *objs):
+            fks = getattr(self.instance, self.field.get_attname())
             if fks is None:
                 fks = set()
-                setattr(self.instance, self.field.attname, fks)
+                setattr(self.instance, self.field.get_attname(), fks)
 
             new_fks = set()
+            rh_field = self.field.foreign_related_fields[0]
             for obj in objs:
-                for lh_field, rh_field in self.field.related_fields:
-                    new_fks.add(getattr(obj, rh_field.attname))
+                new_fks.add(getattr(obj, rh_field.get_attname()))
             fks.update(new_fks)
 
-            remote_field = self.field.remote_field
             db = router.db_for_write(self.instance.__class__, instance=self.instance)
             self.instance_manager.db_manager(db).mongo_update(
-                {self.instance._meta.pk.name: self.instance.pk},
+                self._make_filter(),
                 {
                     '$addToSet': {
                         self.field.attname: {
@@ -635,28 +835,75 @@ def create_forward_array_reference_manager(superclass, rel):
                     }
                 }
             )
-
+        add.alters_data = True
 
         def remove(self, *objs):
-            pass
+            to_del = set(
+                getattr(obj, self.field.foreign_related_fields[0].attname)
+                for obj in objs
+            )
+            self._remove(to_del)
+
+        remove.alters_data = True
+
+        def _remove(self, to_del):
+            fks = getattr(self.instance, self.field.attname)
+            fks.difference_update(to_del)
+            db = self._db or router.db_for_write(self.instance.__class__, instance=self.instance)
+            self.instance_manager.db_manager(db).mongo_update(
+                self._make_filter(),
+                {
+                    '$pull': {
+                        self.field.attname: {
+                            '$in': list(to_del)
+                        }
+                    }
+                }
+            )
 
         def clear(self):
-            pass
+            db = router.db_for_write(self.instance.__class__, instance=self.instance)
+            self.instance_manager.db_manager(db).mongo_update(
+                self._make_filter(),
+                {
+                    '$set': {
+                        self.field.attname: []
+                    }
+                }
+            )
+            setattr(self.instance, self.field.attname, {})
+
+        clear.alters_data = True
+
+        def set(self, objs, *, clear=False):
+            objs = tuple(objs)
+
+            db = router.db_for_write(self.through, instance=self.instance)
+            with transaction.atomic(using=db, savepoint=False):
+                if clear:
+                    self.clear()
+                    self.add(*objs)
+                else:
+                    fks = getattr(self.instance, self.field.attname)
+                    rh_field = self.field.foreign_related_fields[0]
+                    new_fks = set(getattr(obj, rh_field.get_attname()) for obj in objs)
+                    to_del = fks - new_fks
+                    self._remove(to_del)
+                    fks = getattr(self.instance, self.field.attname)
+                    to_add = []
+                    for obj in objs:
+                        if getattr(obj, rh_field.get_attname()) not in fks:
+                            to_add.append(obj)
+                    self.add(to_add)
+
+        set.alters_data = True
 
     return ArrayReferenceManager
 
-class ReverseArrayReferenceDescriptor(ReverseManyToOneDescriptor):
+class ArrayReferenceDescriptor:
 
-    @cached_property
-    def related_manager_cls(self):
-        related_model = self.rel.related_model
-
-        return create_reverse_array_reference_manager(
-            related_model._default_manager.__class__,
-            self.rel,
-        )
-
-class ArrayReferenceDescriptor(ForwardManyToOneDescriptor):
+    def __init__(self, field_with_rel):
+        self.field = field_with_rel
 
     @cached_property
     def related_manager_cls(self):
@@ -670,9 +917,35 @@ class ArrayReferenceDescriptor(ForwardManyToOneDescriptor):
     def __get__(self, instance, cls=None):
         """
         Get the related objects through the reverse relation.
-
         With the example above, when getting ``parent.children``:
+        - ``self`` is the descriptor managing the ``children`` attribute
+        - ``instance`` is the ``parent`` instance
+        - ``cls`` is the ``Parent`` class (unused)
+        """
+        if instance is None:
+            return self
 
+        return self.related_manager_cls(instance)
+
+
+class ReverseArrayReferenceDescriptor:
+
+    def __init__(self, related):
+        self.rel = related
+
+    @cached_property
+    def related_manager_cls(self):
+        related_model = self.rel.related_model
+
+        return create_reverse_array_reference_manager(
+            related_model._default_manager.__class__,
+            self.rel,
+        )
+
+    def __get__(self, instance, cls=None):
+        """
+        Get the related objects through the relation.
+        With the example above, when getting ``parent.children``:
         - ``self`` is the descriptor managing the ``children`` attribute
         - ``instance`` is the ``parent`` instance
         - ``cls`` is the ``Parent`` class (unused)
@@ -691,7 +964,8 @@ class ArrayReferenceDescriptor(ForwardManyToOneDescriptor):
 
 class ArrayReferenceField(ForeignKey):
     """
-    When the entry gets saved, only a reference to the primary_key of the author model is saved in the array.
+    When the entry gets saved, only a reference to the primary_key of the model is saved in the array.
+    For all practical aspects, the ArrayReferenceField behaves like a Django ManyToManyField.
     """
 
     many_to_many = False
@@ -706,7 +980,7 @@ class ArrayReferenceField(ForeignKey):
                  limit_choices_to=None, parent_link=False, to_field=None,
                  db_constraint=True, **kwargs):
 
-        on_delete = on_delete or CASCADE
+        on_delete = on_delete or self._on_delete
         super().__init__(to, on_delete=on_delete, related_name=related_name,
                          related_query_name=related_query_name,
                          limit_choices_to=limit_choices_to,
@@ -715,9 +989,20 @@ class ArrayReferenceField(ForeignKey):
 
         self.concrete = False
 
-    # def contribute_to_class(self, cls, name, private_only=False, **kwargs):
-    #     super().contribute_to_class(cls, name, private_only, **kwargs)
-    #     cls._meta.local_fields.remove(self)
+    @staticmethod
+    def _on_delete(collector, field, sub_objs, using):
+        for model, instances in collector.data.items():
+            for obj in sub_objs:
+                getattr(obj, field.name).db_manager(using).remove(*instances)
+
+
+    def from_db_value(self, value, expression, connection, context):
+        return self.to_python(value)
+
+    def to_python(self, value):
+        if value is None:
+            return set()
+        return set(value)
 
     def get_db_prep_value(self, value, connection, prepared=False):
         if value is None:
@@ -729,5 +1014,3 @@ class ArrayReferenceField(ForeignKey):
         if value is None:
             return []
         return list(value)
-
-
