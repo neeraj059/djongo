@@ -92,7 +92,7 @@ setup(
     install_requires=[
         'sqlparse==0.2.4',
         'pymongo==3.5.0',
-        'django>=2.0',
+        'django==1.11.24',
         'dataclasses>=0.1',
     ],
     extras_require=dict(
